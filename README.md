@@ -31,6 +31,46 @@ for mobile reading and AI audiobook generation.
 - API key is stored in Calibre's plugin config (plaintext on disk — same trust
   model as the Calibre Content Server password).
 
+## What the plugin sends to the server
+
+Full data flow disclosure — every network call the plugin makes:
+
+### `POST /api/calibre/sync-catalog` (when you run "Sync library catalog")
+Per book: `title`, `authors`, `tags`, `series`, `series_index`, `language`,
+`publisher`, `pubdate`, `rating`, `comments (first 500 characters)`, format list,
+size in bytes, `last_modified` timestamp.
+
+**Heads-up:** if you keep personal notes or reviews in the Calibre `comments`
+field, the first 500 characters are uploaded as part of the metadata. Book
+contents are NOT uploaded by this endpoint.
+
+### `POST /api/calibre/cover-upload/{id}` (after metadata sync)
+Cover thumbnails resized client-side to 200×300 JPEG quality 75.
+
+### `POST /api/library/upload` (when you click "Send to MimicReader")
+The book file in your preferred format (EPUB/AZW3/MOBI/PDF/TXT/FB2) plus title
+and author. Only fired on explicit user action.
+
+### `POST /api/calibre/fulfill-upload/{id}` (long-poll, on-demand)
+Same as `/upload` but triggered when you open a book on mobile —
+the plugin uploads the file in response to the server's pending request.
+
+### `GET /api/calibre/pending` (long-poll, idle)
+A long-poll request (~55s timeout) waiting for upload requests from your phone.
+Sends only your API key in the `Authorization` header — no library data.
+
+### `GET /static/mimicreader_send_version.txt` (once per 24h)
+Plain unauthenticated GET to check for plugin updates. Sends nothing about you
+or your library — just a regular HTTP request with the plugin's User-Agent.
+The plugin shows you a dialog if a newer version exists; download and install
+are always manual.
+
+### What the plugin does NOT do
+- No telemetry, no analytics, no usage tracking
+- No phone-home with library statistics
+- No background uploads beyond what's listed above
+- No modification of your Calibre library or `metadata.db`
+
 ## Requirements
 
 - **Calibre:** 5.0 or later
