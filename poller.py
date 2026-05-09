@@ -16,6 +16,7 @@ import threading
 import time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 
 
 POLL_URL_SUFFIX = '/api/calibre/pending'
@@ -104,6 +105,9 @@ class PendingPoller(threading.Thread):
 
         if kind == 'cover':
             self._fulfill_cover(server_url, api_key, pending_id, calibre_id, db)
+        elif kind == 'audiobook':
+            self._fulfill_audiobook(server_url, api_key, pending_id, calibre_id,
+                                    item.get('audiobook_id'), db)
         else:
             self._fulfill_file(server_url, api_key, pending_id, calibre_id, db)
 
@@ -176,6 +180,89 @@ class PendingPoller(threading.Thread):
         with urlopen(req, timeout=60) as resp:
             resp.read()
         log.info('Fulfilled cover %d', calibre_id)
+
+    def _fulfill_audiobook(self, server_url, api_key, pending_id, calibre_id,
+                           audiobook_id, db):
+        """Download finished M4A from MimicReader, save as M4B format on the
+        matching Calibre book record. Chapter atoms are already inside the file
+        (pipeline injects them), so the renamed M4B becomes a proper audiobook."""
+        if not audiobook_id:
+            log.warning('audiobook task without audiobook_id, skipping')
+            return
+
+        # Make sure the book still exists in this Calibre library
+        try:
+            mi = db.get_metadata(calibre_id, get_cover=False)
+            if not mi:
+                self._ack_attach(server_url, api_key, pending_id,
+                                 error='book_not_found_in_calibre')
+                return
+        except Exception as e:
+            log.warning('Cannot read metadata for %d: %s', calibre_id, e)
+            return
+
+        # Download the M4A from the API (it's already encoded with chapter atoms)
+        url = '%s/api/audiobooks/%d/download' % (server_url, audiobook_id)
+        req = Request(url, method='GET')
+        req.add_header('Authorization', 'Bearer %s' % api_key)
+        req.add_header('User-Agent', USER_AGENT)
+        try:
+            with urlopen(req, timeout=300) as resp:
+                content = resp.read()
+        except Exception as e:
+            log.warning('Audiobook download failed: %s', e)
+            self._ack_attach(server_url, api_key, pending_id, error='download_failed:%s' % e)
+            return
+
+        if not content:
+            self._ack_attach(server_url, api_key, pending_id, error='empty_audio')
+            return
+
+        # Save to a temp file then attach as M4B (Calibre stores extension =
+        # format name; the underlying container is identical to M4A).
+        import tempfile, os
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.m4b', delete=False) as f:
+                f.write(content)
+                tmp_path = f.name
+            db.add_format(calibre_id, 'M4B', tmp_path, replace=True, run_hooks=True)
+            log.info('Attached audiobook %d to calibre book %d (%.1f MB)',
+                     audiobook_id, calibre_id, len(content) / 1024 / 1024)
+        except Exception as e:
+            log.warning('add_format failed: %s', e)
+            self._ack_attach(server_url, api_key, pending_id, error='add_format:%s' % e)
+            return
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        self._ack_attach(server_url, api_key, pending_id, error=None)
+
+        # Best-effort GUI notification (status bar)
+        try:
+            from PyQt5.QtCore import QTimer  # type: ignore
+            title = (mi.title if mi else 'Audiobook') if mi else 'Audiobook'
+            QTimer.singleShot(0, lambda: self.gui.status_bar.show_message(
+                'MimicReader: audiobook attached — %s' % title, 5000))
+        except Exception:
+            pass
+
+    def _ack_attach(self, server_url, api_key, pending_id, error):
+        try:
+            url = '%s/api/calibre/ack-attach/%d' % (server_url, pending_id)
+            if error:
+                url += '?error=' + quote(error[:200])
+            req = Request(url, method='POST')
+            req.add_header('Authorization', 'Bearer %s' % api_key)
+            req.add_header('User-Agent', USER_AGENT)
+            with urlopen(req, timeout=15) as resp:
+                resp.read()
+        except Exception as e:
+            log.warning('ack-attach failed: %s', e)
 
 
 # --- helpers ---

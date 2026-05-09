@@ -169,52 +169,142 @@ def sync_library(server_url, api_key, library_uuid, library_name, books, progres
     return result
 
 
-def push_covers(server_url, api_key, library_uuid, book_ids_with_covers, db, progress_cb=None):
-    """After metadata sync, push small JPEG covers for each book so the web UI tiles look nice.
-
-    book_ids_with_covers: iterable of calibre_ids for which to try to upload a cover.
-    Silently skips books where Calibre has no cover.
-    """
+def _upload_one_cover(cid, cover_bytes, server_url, api_key, library_uuid):
+    """Worker — resize + HTTP upload one cover. Returns True on success.
+    Retries on 429 (rate limit) with exponential backoff up to 3 times."""
     import uuid as _uuid
+    import time as _time
+    try:
+        shrunk = _shrink_cover(cover_bytes)
+    except Exception:
+        return False
 
-    total = len(book_ids_with_covers)
-    uploaded = 0
-    failed = 0
+    boundary = '----MimicCover%s' % _uuid.uuid4().hex
+    body = []
+    body.append(('--%s\r\n' % boundary).encode())
+    body.append(('Content-Disposition: form-data; name="file"; filename="cover_%d.jpg"\r\n' % cid).encode())
+    body.append(b'Content-Type: image/jpeg\r\n\r\n')
+    body.append(shrunk)
+    body.append(('\r\n--%s--\r\n' % boundary).encode())
+    payload = b''.join(body)
 
-    for idx, cid in enumerate(book_ids_with_covers, start=1):
-        if progress_cb:
-            keep = progress_cb(idx, total, 'Uploading covers %d / %d' % (idx, total))
-            if keep is False:
-                break
-        try:
-            cover = db.cover(cid, as_image=False, as_file=False)
-        except Exception:
-            continue
-        if not cover:
-            continue
+    url = '%s/api/calibre/cover-upload/%d?library_uuid=%s' % (server_url.rstrip('/'), cid, library_uuid)
 
-        # Shrink client-side to save user's upload bandwidth (1.9 GB → ~400 MB for 27k books)
-        cover = _shrink_cover(cover)
-
-        boundary = '----MimicCover%s' % _uuid.uuid4().hex
-        body = []
-        body.append(('--%s\r\n' % boundary).encode())
-        body.append(('Content-Disposition: form-data; name="file"; filename="cover_%d.jpg"\r\n' % cid).encode())
-        body.append(b'Content-Type: image/jpeg\r\n\r\n')
-        body.append(cover)
-        body.append(('\r\n--%s--\r\n' % boundary).encode())
-        payload = b''.join(body)
-
-        url = '%s/api/calibre/cover-upload/%d?library_uuid=%s' % (server_url.rstrip('/'), cid, library_uuid)
+    for attempt in range(4):  # initial + 3 retries on 429
         req = Request(url, data=payload, method='POST')
         req.add_header('Authorization', 'Bearer %s' % api_key)
         req.add_header('Content-Type', 'multipart/form-data; boundary=%s' % boundary)
-        req.add_header('User-Agent', 'MimicReader-Calibre-Plugin/0.2-covers')
+        req.add_header('User-Agent', 'MimicReader-Calibre-Plugin/0.4-covers')
         try:
             with urlopen(req, timeout=30) as resp:
                 resp.read()
-            uploaded += 1
-        except (HTTPError, URLError):
-            failed += 1
+            return True
+        except HTTPError as e:
+            if e.code == 429 and attempt < 3:
+                # Rate limited — back off (1s, 3s, 7s) and retry
+                _time.sleep(1 + 2 * attempt)
+                continue
+            return False
+        except URLError:
+            return False
+    return False
 
-    return {'uploaded': uploaded, 'failed': failed, 'total': total}
+
+def push_covers(server_url, api_key, library_uuid, book_ids_with_covers, db, progress_cb=None):
+    """Push covers after metadata sync. PURE PYTHON — no Qt. Designed to run from a
+    worker QThread so it never touches the GUI directly.
+
+    Reads covers from `db` and uploads them with a 6-worker ThreadPoolExecutor.
+    progress_cb(done, total, msg) → False to abort (returns whatever was uploaded).
+    Returns: {'uploaded', 'failed', 'skipped', 'total'}.
+    """
+    import concurrent.futures
+    import sys
+
+    book_ids = list(book_ids_with_covers)
+    total = len(book_ids)
+    uploaded = 0
+    failed = 0
+    skipped = 0
+    cancelled = False
+    first_error_logged = False
+
+    PARALLEL = 6
+    CHUNK = 24
+
+    def _format_msg(done, total, uploaded, skipped, failed):
+        # 'skipped' = books with no cover in Calibre (has_cover=0). NOT an error.
+        return 'Covers %d / %d  sent %d  no-cover %d%s' % (
+            done, total, uploaded, skipped,
+            ('  failed %d' % failed) if failed else '',
+        )
+
+    def _emit(done):
+        if progress_cb:
+            if not progress_cb(done, total, _format_msg(done, total, uploaded, skipped, failed)):
+                return False
+        return True
+
+    print('[MimicReader] push_covers: starting %d books, parallel=%d chunk=%d' % (
+        total, PARALLEL, CHUNK), file=sys.stderr)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL) as executor:
+        for chunk_start in range(0, total, CHUNK):
+            if cancelled:
+                break
+
+            chunk_ids = book_ids[chunk_start:chunk_start + CHUNK]
+
+            # 1) Read covers
+            chunk_work = []
+            for cid in chunk_ids:
+                try:
+                    cover = db.cover(cid, as_image=False, as_file=False)
+                except Exception as e:
+                    if not first_error_logged:
+                        print('[MimicReader] db.cover() error cid=%d: %s' % (cid, e), file=sys.stderr)
+                        first_error_logged = True
+                    cover = None
+                if cover:
+                    chunk_work.append((cid, cover))
+                else:
+                    skipped += 1
+
+            done_count = uploaded + failed + skipped
+            if not _emit(done_count):
+                cancelled = True
+                break
+
+            if not chunk_work:
+                continue
+
+            # 2) Submit + wait this chunk
+            futures = [
+                executor.submit(_upload_one_cover, cid, cb, server_url, api_key, library_uuid)
+                for cid, cb in chunk_work
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    ok = future.result()
+                except Exception as e:
+                    if not first_error_logged:
+                        print('[MimicReader] upload worker exception: %s' % e, file=sys.stderr)
+                        first_error_logged = True
+                    ok = False
+                if ok:
+                    uploaded += 1
+                else:
+                    failed += 1
+
+            done_count = uploaded + failed + skipped
+            if not _emit(done_count):
+                cancelled = True
+
+            if done_count % 1000 < CHUNK:
+                print('[MimicReader] %d/%d  sent=%d failed=%d no-cover=%d' % (
+                    done_count, total, uploaded, failed, skipped), file=sys.stderr)
+
+    print('[MimicReader] push_covers DONE  sent=%d failed=%d no-cover=%d' % (
+        uploaded, failed, skipped), file=sys.stderr)
+
+    return {'uploaded': uploaded, 'failed': failed, 'skipped': skipped, 'total': total}

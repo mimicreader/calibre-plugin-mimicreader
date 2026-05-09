@@ -43,9 +43,9 @@ def send_book(server_url: str, api_key: str, title: str, author: str,
     from urllib.error import HTTPError, URLError
 
     if not server_url:
-        raise RuntimeError('Server URL not configured — open Preferences → Plugins → MimicReader Send.')
+        raise RuntimeError('Server URL not configured — open Preferences → Plugins → MimicReader.')
     if not api_key:
-        raise RuntimeError('API key not configured — open Preferences → Plugins → MimicReader Send.')
+        raise RuntimeError('API key not configured — open Preferences → Plugins → MimicReader.')
 
     content_type = FORMAT_CONTENT_TYPES.get(fmt.upper(), 'application/octet-stream')
     safe_name = ''.join(c if c.isalnum() or c in ' -_.' else '_' for c in (title or 'book'))[:80].strip() or 'book'
@@ -124,3 +124,36 @@ def trigger_generation(server_url: str, api_key: str, book_id: int, tier: str = 
         raise RuntimeError(f'Generation start failed (HTTP {e.code}): {err_body or e.reason}')
     except URLError as e:
         raise RuntimeError(f'Network error starting generation: {e.reason}')
+
+
+def bulk_queue(server_url: str, api_key: str, library_uuid: str, book_ids: list) -> dict:
+    """POST /api/calibre/bulk-queue with selected book IDs.
+
+    Server validates which IDs are in the synced catalog and queues uploads.
+    The plugin's background poller fulfills each row later (long-poll cycle).
+    """
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
+
+    payload = json.dumps({
+        'library_uuid': library_uuid,
+        'calibre_ids': list(book_ids),
+    }).encode('utf-8')
+
+    url = f'{server_url.rstrip("/")}/api/calibre/bulk-queue'
+    req = Request(url, data=payload, method='POST')
+    req.add_header('Authorization', f'Bearer {api_key}')
+    req.add_header('Content-Type', 'application/json')
+
+    try:
+        with urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8', errors='replace')[:500]
+        except Exception:
+            pass
+        raise RuntimeError(f'Bulk queue failed (HTTP {e.code}): {err_body or e.reason}')
+    except URLError as e:
+        raise RuntimeError(f'Network error: {e.reason}')

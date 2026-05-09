@@ -59,6 +59,34 @@ the plugin uploads the file in response to the server's pending request.
 A long-poll request (~55s timeout) waiting for upload requests from your phone.
 Sends only your API key in the `Authorization` header — no library data.
 
+### `POST /api/calibre/bulk-queue` (when you queue many books at once)
+List of selected Calibre book IDs + library UUID. The server marks them as
+pending; the long-poll worker uploads each file in the background. Use this
+when sending more than a handful of books — the GUI stays responsive while
+uploads run in a daemon thread.
+
+### `GET /api/audiobooks/{id}/download` (when an audiobook is ready)
+Downloads the generated M4B file so the plugin can attach it back into your
+Calibre book record as a new format. Triggered by the long-poll worker when
+the server signals that generation completed.
+
+### `POST /api/calibre/ack-attach/{id}` (after auto-attach)
+Confirms to the server that the M4B was successfully attached to Calibre,
+so it doesn't ask again. Includes a small status string (`ok` or
+`download_failed:<reason>`) — no library content.
+
+### `GET /api/auth/me` and `GET /api/payments/balance` (config dialog only)
+Reads your own account: email, free-tier credit balance, total purchased.
+Fired only when you open the plugin's Preferences pane — used to show
+"Account: …" and "Credits: … kr" in the config dialog. Not called during
+normal sync or upload flows.
+
+### `DELETE /api/calibre/library` (Danger Zone, manual click)
+Wipes your synced Calibre catalog, covers, and pending uploads from the
+MimicReader server. Requires you to click the red "Delete my Calibre data"
+button in the plugin's Preferences pane and confirm. Generated audiobooks
+and your local Calibre library are NOT affected.
+
 ### `GET /static/mimicreader_send_version.txt` (once per 24h)
 Plain unauthenticated GET to check for plugin updates. Sends nothing about you
 or your library — just a regular HTTP request with the plugin's User-Agent.
@@ -80,7 +108,7 @@ are always manual.
 ## Building from source
 
 ```bash
-zip -r mimicreader_send.zip __init__.py config.py main.py poller.py sync.py ui.py update_check.py images/ plugin-import-name-mimicreader_send.txt
+zip -r mimicreader_send.zip __init__.py config.py main.py poller.py sync.py ui.py update_check.py worker.py images/ plugin-import-name-mimicreader_send.txt
 ```
 
 Then load the resulting zip via **Preferences → Plugins → Load plugin from file**.
